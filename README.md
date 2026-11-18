@@ -52,7 +52,7 @@ A task becomes `done` only through one of these paths, and each records provenan
 | `write` | a file-write tool reported the write |
 | `native-plan` | DSH's own plan marks that exact item completed |
 | `execution` | a shell command reported exit 0 (plain `bash` `[exit: 0]`, or a `run_code` wrapper whose nested exit code is 0) and exactly one open task shares its object |
-| `model mapping` | `mapCompletion` asks a model *which* open task a verified exit-0 command finishes; the engine still owns the success predicate |
+| `model attribution` | `mapCompletion` asks a model *which* open task a verified success (test suite, signing, exit-0 command) or an assistant completion claim establishes; the engine still owns the success predicate and refuses claims that cite a different number |
 | `user-confirmation` | you say in chat that a task is finished |
 | `assistant-verified` | `proseCompletion`: the assistant says the work is finished, verified or confirmed, naming that task's object |
 

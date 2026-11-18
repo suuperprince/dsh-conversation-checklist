@@ -23,6 +23,8 @@ import {
   successfulCommand,
   completeByMapping,
   completeFromAssistantProse,
+  evidenceFromToolResult,
+  claimSentences,
   ingestAnswer,
   EXTRACTOR_VERSION,
   applyOps,
@@ -328,27 +330,39 @@ export function apply(ctx, config) {
    * success itself is established here, from the logged exit code, so this path
    * cannot manufacture progress from prose.
    */
-  /** Verified exit-0 commands from a whole conversation, newest first, deduped. */
-  function collectSuccessfulCommands(session, limit = 3) {
+  /**
+   * Evidence a model may attribute to a task: passing test suites, signing
+   * verifications, exit-0 commands, and assistant completion claims — newest
+   * first, deduped, bounded.
+   */
+  function collectEvidence(session, limit = 3, before = Infinity) {
     if (typeof session?.snapshotEvents !== 'function') return []
     const events = session.snapshotEvents(0)
     const seen = new Set()
     const out = []
+    const push = (kind, text, seq) => {
+      const key = `${kind}|${text}`
+      if (out.length >= limit || seen.has(key)) return
+      seen.add(key)
+      out.push({ kind, text, seq })
+    }
     for (let i = events.length - 1; i >= 0 && out.length < limit; i -= 1) {
       const e = events[i]
-      if (e.type !== 'tool/result') continue
-      const data = e.data ?? {}
-      const call = toolCallFor(session, data.message?.toolCallId)
-      const command = successfulCommand({
-        ok: !data.error && data.message?.isError !== true,
-        toolName: call?.name ?? '',
-        argumentsText: typeof call?.arguments === 'string' ? call.arguments : '',
-        resultText: messageText(data.message),
-        seq: e.seq,
-      })
-      if (!command || seen.has(command)) continue
-      seen.add(command)
-      out.push({ command, seq: e.seq })
+      if (typeof e.seq === 'number' && e.seq >= before) continue
+      if (e.type === 'tool/result') {
+        const data = e.data ?? {}
+        const call = toolCallFor(session, data.message?.toolCallId)
+        const evidence = evidenceFromToolResult({
+          ok: !data.error && data.message?.isError !== true,
+          toolName: call?.name ?? '',
+          argumentsText: typeof call?.arguments === 'string' ? call.arguments : '',
+          resultText: messageText(data.message),
+          seq: e.seq,
+        })
+        if (evidence) push(evidence.kind, evidence.text, e.seq)
+      } else if (e.type === 'assistant/message') {
+        for (const claim of claimSentences(messageText(e.data?.message))) push('assistant-verified', claim, e.seq)
+      }
     }
     return out
   }
@@ -356,26 +370,9 @@ export function apply(ctx, config) {
   function scheduleMapping(key, doc, session, turnEnd) {
     const open = doc.tasks.filter((t) => ['todo', 'doing'].includes(t.status) && !t.manual?.status)
     if (open.length === 0) return
-    const events = typeof session.snapshotEvents === 'function' ? session.snapshotEvents(0) : []
-    let command = null
-    let seq = null
-    for (let i = events.length - 1; i >= 0; i -= 1) {
-      const e = events[i]
-      if (e.seq >= turnEnd.seq) continue
-      if (e.type !== 'tool/result') continue
-      const data = e.data ?? {}
-      const call = toolCallFor(session, data.message?.toolCallId)
-      const input = {
-        ok: !data.error && data.message?.isError !== true,
-        toolName: call?.name ?? '',
-        argumentsText: typeof call?.arguments === 'string' ? call.arguments : '',
-        resultText: messageText(data.message),
-        seq: e.seq,
-      }
-      command = successfulCommand(input)
-      if (command) { seq = e.seq; break }
-    }
-    if (!command) return
+    const evidenceItems = collectEvidence(session, 1, turnEnd.seq)
+    if (evidenceItems.length === 0) return
+    const evidence = evidenceItems[0]
     const job = { seq: turnEnd.seq }
     void (async () => {
       try {
@@ -385,7 +382,7 @@ export function apply(ctx, config) {
         const list = open.map((t) => `${t.id} :: ${t.text}`).join('\n')
         const reply = await complete(llm, route, {
           system: MAPPING_SYSTEM,
-          prompt: `Open tasks:\n${list}\n\nFinished command (exited 0):\n${command.slice(0, 600)}`,
+          prompt: `Open tasks:\n${list}\n\nEvidence (${evidence.kind}):\n${evidence.text.slice(0, 600)}`,
           maxTokens: 400,
           timeoutMs: opts.model.timeoutMs,
         })
@@ -393,7 +390,7 @@ export function apply(ctx, config) {
         if (!taskId) return
         await serial(key, async () => {
           if (closed.value || docs.get(key) !== doc || doc.tracking === false) return
-          if (!completeByMapping(doc, { taskId, seq, command, sessionId: key })) return
+          if (!completeByMapping(doc, { taskId, seq: evidence.seq, command: evidence.text, sessionId: key, kind: evidence.kind === 'assistant-verified' ? 'assistant-verified' : 'execution' })) return
           await commit(key)
         })
       } catch (error) {
@@ -469,7 +466,7 @@ export function apply(ctx, config) {
         if (!sessionId) return json(res, 400, { ok: false, error: 'sessionId-required' })
         try {
           const doc = await serial(sessionId, () => hydrateIfNeeded(sessionId))
-          json(res, 200, { ok: true, version: '1.1.1', extractorVersion: EXTRACTOR_VERSION, checklist: project(doc), tracking: doc.tracking !== false })
+          json(res, 200, { ok: true, version: '1.1.2', extractorVersion: EXTRACTOR_VERSION, checklist: project(doc), tracking: doc.tracking !== false })
         } catch (error) {
           json(res, 500, { ok: false, error: 'read-failed', message: String(error?.message ?? error) })
         }
@@ -579,23 +576,25 @@ export function apply(ctx, config) {
                           session = { id: key, snapshotEvents: (from = 0, to = events.length) => events.slice(from, to) }
                         }
                       }
-                      const commands = collectSuccessfulCommands(session)
-                      if (commands.length > 0) summary.withCommand += 1
-                      for (const { command, seq } of commands.slice(0, 1)) {
+                      const evidenceItems = collectEvidence(session, 2)
+                      if (evidenceItems.length > 0) summary.withCommand += 1
+                      for (const evidence of evidenceItems) {
                         if (mapBudget <= 0) break
+                        const stillOpen = doc.tasks.filter((t) => ['todo', 'doing'].includes(t.status) && !t.manual?.status)
+                        if (stillOpen.length === 0) break
                         mapBudget -= 1
                         summary.mapCalls += 1
-                        const list = open.map((t) => `${t.id} :: ${t.text}`).join('\n')
+                        const list = stillOpen.map((t) => `${t.id} :: ${t.text}`).join('\n')
                         const reply = await complete(llm, route, {
                           system: MAPPING_SYSTEM,
-                          prompt: `Open tasks:\n${list}\n\nFinished command (exited 0):\n${command.slice(0, 600)}`,
+                          prompt: `Open tasks:\n${list}\n\nEvidence (${evidence.kind}):\n${evidence.text.slice(0, 600)}`,
                           maxTokens: 400,
                           timeoutMs: opts.model.timeoutMs,
                         }).catch(() => null)
                         if (reply === null) summary.mapNoReply += 1
                         const taskId = parseMapping(reply)
                         if (reply !== null && !taskId) summary.mapNoPick += 1
-                        if (taskId && completeByMapping(doc, { taskId, seq, command, sessionId: key })) {
+                        if (taskId && completeByMapping(doc, { taskId, seq: evidence.seq, command: evidence.text, sessionId: key, kind: evidence.kind === 'assistant-verified' ? 'assistant-verified' : 'execution' })) {
                           summary.mapped += 1
                           await commit(key)
                         }

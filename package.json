@@ -1,6 +1,6 @@
 {
   "name": "dsh-conversation-checklist",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "private": true,
   "type": "module",
   "description": "A live, independent per-session conversation checklist opened from a three-line composer button.",

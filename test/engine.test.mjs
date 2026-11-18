@@ -481,7 +481,7 @@ test('completeByMapping closes one open task and refuses locks', () => {
   const task = doc.tasks[0]
   assert.equal(completeByMapping(doc, { taskId: task.id, seq: 77, command: 'docker compose up -d' }), true)
   assert.equal(task.status, 'done')
-  assert.match(task.completedBy.reason, /model mapped an exit-0 command/)
+  assert.match(task.completedBy.reason, /model attributed execution evidence/)
   assert.equal(completeByMapping(doc, { taskId: task.id, seq: 78, command: 'x' }), false, 'already done')
 
   const doc2 = createDoc('s-map2')
@@ -513,4 +513,13 @@ test('a destructive outcome needs an explicit verification word', () => {
   say(doc, 'user', 'Deploy the release.', 1)
   assert.equal(completeFromAssistantProse(doc, { text: 'The release deploy is done.', seq: 9 }), false)
   assert.equal(completeFromAssistantProse(doc, { text: 'The release deploy is done and verified on the target.', seq: 10 }), true)
+})
+
+test('a claim citing a different number never closes the task', () => {
+  const doc = createDoc('s-num')
+  say(doc, 'user', 'Run Phase 0 step by step.', 1)
+  assert.equal(completeByMapping(doc, { taskId: doc.tasks[0].id, seq: 9, command: '## Phase 1 step 1 complete' }), false)
+  assert.equal(completeFromAssistantProse(doc, { text: '## Phase 1 step 1 complete', seq: 10 }), false)
+  assert.equal(doc.tasks[0].status, 'todo')
+  assert.equal(completeByMapping(doc, { taskId: doc.tasks[0].id, seq: 11, command: 'Phase 0 step 3 done and verified' }), true)
 })

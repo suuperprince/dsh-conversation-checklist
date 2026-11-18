@@ -578,7 +578,7 @@ test('model mapping closes a task for a verified exit-0 command only', async () 
   const ok = await run('[exit: 0 ]')
   const task = ok.state.checklist.tasks[0]
   assert.equal(task.status, 'done', 'mapping completed it')
-  assert.match(task.completedBy.reason, /model mapped an exit-0 command/)
+  assert.match(task.completedBy.reason, /model attributed execution evidence/)
   assert.ok(ok.systems.some((s) => /match one finished shell command/.test(s)), 'mapping was asked')
 
   const bad = await run('[exit code: 1]')
