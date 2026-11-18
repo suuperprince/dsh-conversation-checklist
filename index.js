@@ -53,6 +53,7 @@ function optionsOf(config) {
     // Model mapping: one bounded call per finished turn that actually produced a
     // verified exit-0 command, asking only which open task that command finished.
     mapCompletion: raw.mapCompletion !== false,
+    mapAuditLimit: Number.isFinite(raw.mapAuditLimit) ? raw.mapAuditLimit : 40,
     dataDir: join(dataRoot, 'dsh-conversation-checklist'),
     model: {
       provider: typeof model.provider === 'string' ? model.provider : '',
@@ -320,6 +321,31 @@ export function apply(ctx, config) {
    * success itself is established here, from the logged exit code, so this path
    * cannot manufacture progress from prose.
    */
+  /** Verified exit-0 commands from a whole conversation, newest first, deduped. */
+  function collectSuccessfulCommands(session, limit = 3) {
+    if (typeof session?.snapshotEvents !== 'function') return []
+    const events = session.snapshotEvents(0)
+    const seen = new Set()
+    const out = []
+    for (let i = events.length - 1; i >= 0 && out.length < limit; i -= 1) {
+      const e = events[i]
+      if (e.type !== 'tool/result') continue
+      const data = e.data ?? {}
+      const call = toolCallFor(session, data.message?.toolCallId)
+      const command = successfulCommand({
+        ok: !data.error && data.message?.isError !== true,
+        toolName: call?.name ?? '',
+        argumentsText: typeof call?.arguments === 'string' ? call.arguments : '',
+        resultText: messageText(data.message),
+        seq: e.seq,
+      })
+      if (!command || seen.has(command)) continue
+      seen.add(command)
+      out.push({ command, seq: e.seq })
+    }
+    return out
+  }
+
   function scheduleMapping(key, doc, session, turnEnd) {
     const open = doc.tasks.filter((t) => ['todo', 'doing'].includes(t.status) && !t.manual?.status)
     if (open.length === 0) return
@@ -353,7 +379,7 @@ export function apply(ctx, config) {
         const reply = await complete(llm, route, {
           system: MAPPING_SYSTEM,
           prompt: `Open tasks:\n${list}\n\nFinished command (exited 0):\n${command.slice(0, 600)}`,
-          maxTokens: 120,
+          maxTokens: 400,
           timeoutMs: opts.model.timeoutMs,
         })
         const taskId = parseMapping(reply)
@@ -511,12 +537,68 @@ export function apply(ctx, config) {
         if (body.kind === 'reaudit') {
           // Maintenance: replay every stored conversation through the current
           // rules so already-derived checklists pick up new completion evidence.
-          const keys = await store.list()
+          const wanted = Array.isArray(body.sessionIds) ? new Set(body.sessionIds.map(String)) : null
+          const allKeys = await store.list()
+          const keys = wanted ? allKeys.filter((k) => wanted.has(k)) : allKeys
           const summary = { sessions: 0, failed: 0, doneBefore: 0, doneAfter: 0, gained: [] }
+          summary.mapped = 0
+          summary.mapCalls = 0
+          summary.mapNoReply = 0
+          summary.mapNoPick = 0
+          summary.withCommand = 0
+          summary.withOpen = 0
+          let mapBudget = Number.isFinite(opts.mapAuditLimit) ? opts.mapAuditLimit : 40
           for (const key of keys) {
             try {
               const before = project(await documentFor(key))
               const doc = await serial(key, () => hydrateIfNeeded(key))
+              // Model mapping over history: only a verified exit-0 command may
+              // close a task, and the model merely says which one it establishes.
+              if (opts.mapCompletion && mapBudget > 0) {
+                const open = doc.tasks.filter((t) => ['todo', 'doing'].includes(t.status) && !t.manual?.status)
+                if (open.length > 0) {
+                  summary.withOpen += 1
+                  const route = modelRoute()
+                  const llm = route ? ctx.get('llm') : null
+                  if (llm) {
+                    let observation
+                    let session = ctx.get('sessions')?.get?.(key)
+                    try {
+                      if (!session) {
+                        const query = ctx.get('sessionQuery')
+                        if (typeof query?.observeSession === 'function') {
+                          observation = await query.observeSession(key, { projectionMode: 'none' })
+                          const events = observation.events ?? []
+                          session = { id: key, snapshotEvents: (from = 0, to = events.length) => events.slice(from, to) }
+                        }
+                      }
+                      const commands = collectSuccessfulCommands(session)
+                      if (commands.length > 0) summary.withCommand += 1
+                      for (const { command, seq } of commands.slice(0, 1)) {
+                        if (mapBudget <= 0) break
+                        mapBudget -= 1
+                        summary.mapCalls += 1
+                        const list = open.map((t) => `${t.id} :: ${t.text}`).join('\n')
+                        const reply = await complete(llm, route, {
+                          system: MAPPING_SYSTEM,
+                          prompt: `Open tasks:\n${list}\n\nFinished command (exited 0):\n${command.slice(0, 600)}`,
+                          maxTokens: 400,
+                          timeoutMs: opts.model.timeoutMs,
+                        }).catch(() => null)
+                        if (reply === null) summary.mapNoReply += 1
+                        const taskId = parseMapping(reply)
+                        if (reply !== null && !taskId) summary.mapNoPick += 1
+                        if (taskId && completeByMapping(doc, { taskId, seq, command, sessionId: key })) {
+                          summary.mapped += 1
+                          await commit(key)
+                        }
+                      }
+                    } finally {
+                      observation?.[Symbol.dispose]?.()
+                    }
+                  }
+                }
+              }
               const after = project(doc)
               summary.sessions += 1
               summary.doneBefore += before.counts.done
