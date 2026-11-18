@@ -1,0 +1,28 @@
+# dsh-conversation-checklist bundle patch.
+#
+# Host half (index.js) folds committed session events into one checklist
+# document per conversation, persists it under
+# $DSH_HOME/plugin-data/dsh-conversation-checklist/, and publishes it over
+#   GET  /api/dsh-conversation-checklist/state?sessionId=…
+#   GET  /api/dsh-conversation-checklist/stream?sessionId=…   (SSE)
+#   POST /api/dsh-conversation-checklist/action
+# Browser half (client.js) registers the three-line button in
+# `conversation.input.left` and the anchored panel in
+# `conversation.input.overlay`; both are Session-scoped, so the shell binds each
+# to the conversation on screen.
+- insert:
+    - id: dsh-conversation-checklist
+      name: dsh-conversation-checklist
+      config:
+        enabled: true
+        # 'rules' = deterministic, no model call (default).
+        # 'model' = use the route below (or the profile default route) instead,
+        #           falling back to the rules when the call fails.
+        extraction: rules
+        maxTasks: 300
+        model:
+          provider: ''
+          model: ''
+          maxChars: 4000
+          maxTokens: 700
+          timeoutMs: 20000

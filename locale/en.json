@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Conversation checklist",
+    "description": "Turns the active conversation into a live checklist. A left-column entry carries the pending count; one click opens the full checklist for that conversation, with subtasks, blockers, suggestions and manual edits that survive later syncs. Each conversation keeps its own checklist across restarts.",
+    "detail": "docs/DETAIL.md"
+  }
+}

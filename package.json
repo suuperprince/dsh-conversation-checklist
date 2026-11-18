@@ -1,0 +1,57 @@
+{
+  "name": "dsh-conversation-checklist",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "description": "A live, independent per-session conversation checklist opened from a three-line composer button.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "checklist",
+    "tasks",
+    "conversation"
+  ],
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.2.2-rc.3 <0.3.0-0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "slots"
+      ]
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.2-rc.3": "source-inspected; patched build integration tests passed; live deployment pending"
+      },
+      "note": "Uses supported session events, web routes and session-scoped composer slots. See REVIEW.md for verified fixes and remaining live validation."
+    }
+  }
+}
