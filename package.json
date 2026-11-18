@@ -56,10 +56,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/OWNER/dsh-conversation-checklist.git"
+    "url": "git+https://github.com/suuperprince/dsh-conversation-checklist.git"
   },
-  "homepage": "https://github.com/OWNER/dsh-conversation-checklist#readme",
+  "homepage": "https://github.com/suuperprince/dsh-conversation-checklist#readme",
   "bugs": {
-    "url": "https://github.com/OWNER/dsh-conversation-checklist/issues"
+    "url": "https://github.com/suuperprince/dsh-conversation-checklist/issues"
   }
 }

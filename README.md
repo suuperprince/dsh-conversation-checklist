@@ -17,19 +17,19 @@ Requirements: DSH 0.2.2-rc.3 or newer (below 0.3), and a writable `$DSH_HOME` (c
 **From a GitHub release (recommended).** Download the `.tgz` from the release page, then in DSH open **Plugins → Add plugin** and paste its URL:
 
 ```
-https://github.com/OWNER/dsh-conversation-checklist/releases/latest/download/dsh-conversation-checklist-1.1.0.tgz
+https://github.com/suuperprince/dsh-conversation-checklist/releases/latest/download/dsh-conversation-checklist-1.1.0.tgz
 ```
 
 **From the repository** (tracks the default branch):
 
 ```
-dsh plugin --profile <profile> add github:OWNER/dsh-conversation-checklist
+dsh plugin --profile <profile> add github:suuperprince/dsh-conversation-checklist
 ```
 
 or, with the agent's `plugin_manager` tool:
 
 ```
-plugin_manager action=install_bundle target=github:OWNER/dsh-conversation-checklist
+plugin_manager action=install_bundle target=github:suuperprince/dsh-conversation-checklist
 ```
 
 **From npm**, once published:
