@@ -469,7 +469,7 @@ export function apply(ctx, config) {
         if (!sessionId) return json(res, 400, { ok: false, error: 'sessionId-required' })
         try {
           const doc = await serial(sessionId, () => hydrateIfNeeded(sessionId))
-          json(res, 200, { ok: true, version: '1.1.0', extractorVersion: EXTRACTOR_VERSION, checklist: project(doc), tracking: doc.tracking !== false })
+          json(res, 200, { ok: true, version: '1.1.1', extractorVersion: EXTRACTOR_VERSION, checklist: project(doc), tracking: doc.tracking !== false })
         } catch (error) {
           json(res, 500, { ok: false, error: 'read-failed', message: String(error?.message ?? error) })
         }

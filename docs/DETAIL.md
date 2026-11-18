@@ -17,6 +17,12 @@ Each task has a stable id, an optional parent id, a status (`todo`, `doing`, `bl
 - A task is completed when you confirm it or the conversation establishes a reliable result.
 - Blocked tasks stay visible with their dependency named, and the dependency is tracked under them.
 
+## How completion is decided
+
+A task is closed only by evidence, never by turn completion or by the mere act of trying. Supported evidence: a passing test result, a successful signing check, a reported file write, an exact native-plan completion, a shell command that exited 0 and names the task's object, an assistant sentence that reports the work finished (guarded: no questions, hedges, future claims, bullets or evidence dumps; destructive outcomes need an explicit verification), or your own statement in chat.
+
+Automated closure never overrides a status you set by hand, and an ambiguous match leaves the task open on purpose. Every closure stores its provenance — kind, session, event sequence and a short reason — so a checked row can be explained later.
+
 ## Manual edits
 
 Rename, check off, reopen, and dismiss from the panel. A manual change is remembered and later syncs do not overwrite it.
