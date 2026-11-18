@@ -19,13 +19,17 @@ import {
   ingestMessage,
   ingestNativePlan,
   ingestGoal,
-  applyManual,
+  ingestToolResult,
+  successfulCommand,
+  completeByMapping,
+  ingestAnswer,
+  EXTRACTOR_VERSION,
   applyOps,
   project,
   stripInjected,
 } from './lib/engine.js'
 import { createStore } from './lib/store.js'
-import { complete, parseModelReply, SYSTEM as MODEL_SYSTEM } from './lib/model.js'
+import { complete, parseModelReply, parseMapping, SYSTEM as MODEL_SYSTEM, MAPPING_SYSTEM } from './lib/model.js'
 
 const ROUTE_BASE = '/api/dsh-conversation-checklist'
 const MAX_TEXT = 8000
@@ -46,6 +50,9 @@ function optionsOf(config) {
   return {
     enabled: raw.enabled !== false,
     extraction: raw.extraction === 'model' ? 'model' : 'rules',
+    // Model mapping: one bounded call per finished turn that actually produced a
+    // verified exit-0 command, asking only which open task that command finished.
+    mapCompletion: raw.mapCompletion !== false,
     dataDir: join(dataRoot, 'dsh-conversation-checklist'),
     model: {
       provider: typeof model.provider === 'string' ? model.provider : '',
@@ -72,6 +79,11 @@ function messageText(message) {
   return out.slice(0, MAX_TEXT)
 }
 
+function toolResultText(message) {
+  const text = (message?.content ?? []).filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n')
+  return text.length <= 24000 ? text : text.slice(0, 8000) + '\n[output omitted]\n' + text.slice(-16000)
+}
+
 export function apply(ctx, config) {
   const opts = optionsOf(config)
   if (!opts.enabled) {
@@ -87,6 +99,7 @@ export function apply(ctx, config) {
   /** @type {Map<string, Set<import('node:http').ServerResponse>>} */
   const listeners = new Map()
   const modelJobs = new Map()
+  const toolCalls = new WeakMap()
   const closed = { value: false }
 
   // -- serial execution ------------------------------------------------------
@@ -108,18 +121,19 @@ export function apply(ctx, config) {
     const cached = docs.get(key)
     if (cached) return cached
     const stored = await store.load(key)
-    let doc = stored && stored.sessionId === key ? stored : createDoc(key)
-    const session = ctx.get('sessions')?.get?.(key)
-    if (doc.extractorVersion !== 2 && typeof session?.snapshotEvents === 'function' && doc.tracking !== false) {
-      const fresh = createDoc(key)
-      fresh.dismissedSuggestions = doc.dismissedSuggestions ?? []
-      foldSnapshot(fresh, session)
-      preserveManualChanges(doc, fresh)
-      await store.save(key, fresh)
-      doc = fresh
-    }
+    const doc = stored && stored.sessionId === key ? stored : createDoc(key)
     docs.set(key, doc)
     return doc
+  }
+
+  async function migrate(key, doc, session) {
+    if (doc.extractorVersion === EXTRACTOR_VERSION || typeof session?.snapshotEvents !== 'function') return doc
+    await store.backup(key, doc)
+    const fresh = createDoc(key)
+    foldSnapshot(fresh, session)
+    docs.set(key, fresh)
+    await commit(key)
+    return fresh
   }
 
   // -- publication -----------------------------------------------------------
@@ -192,7 +206,23 @@ export function apply(ctx, config) {
   }
 
   // -- event folding ---------------------------------------------------------
-  function foldEvent(doc, event) {
+  /** The tool/call a result belongs to, resolved from the committed log. */
+  function toolCallFor(session, callId) {
+    if (typeof session?.snapshotEvents !== 'function' || callId === undefined) return undefined
+    let calls = toolCalls.get(session)
+    if (!calls) {
+      calls = new Map()
+      toolCalls.set(session, calls)
+    }
+    if (!calls.has(callId)) {
+      for (const event of session.snapshotEvents(0)) {
+        if (event.type === 'tool/call') calls.set(event.data.callId, event.data)
+      }
+    }
+    return calls.get(callId)
+  }
+
+  function foldEvent(doc, event, session) {
     if (typeof event?.seq === 'number' && event.seq <= doc.processedSeq) return false
     let changed = false
     const data = event?.data
@@ -204,6 +234,27 @@ export function apply(ctx, config) {
         if (text) {
           changed = ingestMessage(doc, { role: human ? 'user' : 'assistant', text, seq: event.seq }).changed
         }
+      }
+      if (event?.type === 'tool/call' && session) {
+        if (!toolCalls.has(session)) toolCalls.set(session, new Map())
+        toolCalls.get(session).set(data.callId, data)
+      }
+      if (event?.type === 'tool/result') {
+        // Execution evidence: a finished call can complete a task, a failed one never does.
+        const data2 = event.data ?? {}
+        const ok = !data2.error && data2.message?.isError !== true
+        const call = toolCallFor(session, data2.message?.toolCallId)
+        changed = ingestToolResult(doc, {
+          ok,
+          toolName: call?.name ?? '',
+          argumentsText: typeof call?.arguments === 'string' ? call.arguments : '',
+          resultText: toolResultText(data2.message),
+          seq: event.seq,
+        }) || changed
+      }
+      if (event?.type === 'turn/end' && event.data?.reason?.kind === 'completed' && session) {
+        const input = turnText(session, event)
+        if (input) changed = ingestAnswer(doc, {userSeq:input.seq, assistantSeq:input.assistantSeq, text:input.assistant}) || changed
       }
       if (event?.type === 'todo/write' || event?.type === 'tool/call') {
         changed = ingestNativePlan(doc, event) || changed
@@ -217,9 +268,9 @@ export function apply(ctx, config) {
   function foldSnapshot(doc, session, before = Infinity) {
     if (typeof session?.snapshotEvents !== 'function') return false
     let changed = false
-    for (const event of session.snapshotEvents(0)) {
+    for (const event of session.snapshotEvents(Math.max(0, doc.processedSeq + 1))) {
       if (event.seq >= before) break
-      changed = foldEvent(doc, event) || changed
+      changed = foldEvent(doc, event, session) || changed
     }
     return changed
   }
@@ -228,14 +279,18 @@ export function apply(ctx, config) {
     if (typeof session.snapshotEvents !== 'function') return null
     const events = session.snapshotEvents(0)
     let assistant = ''
+    let assistantSeq = null
     for (let i = events.length - 1; i >= 0; i -= 1) {
       const event = events[i]
       if (event.seq >= turnEnd.seq) continue
-      if (!assistant && event.type === 'assistant/message') assistant = stripInjected(messageText(event.data?.message)).trim()
+      if (!assistant && event.type === 'assistant/message') {
+        assistant = stripInjected(messageText(event.data?.message)).trim()
+        assistantSeq = event.seq
+      }
       if (event.type === 'turn/start' && event.data?.turn === turnEnd.data?.turn) break
       if (event.type !== 'user/message' || (event.data?.source && event.data.source.kind !== 'user')) continue
       const text = stripInjected(messageText(event.data)).trim()
-      if (text) return { text: assistant ? `User: ${text}\nFinal assistant message: ${assistant}` : text, seq: event.seq }
+      if (text) return { text: assistant ? `User: ${text}\nFinal assistant message: ${assistant}` : text, seq: event.seq, assistant, assistantSeq }
     }
     return null
   }
@@ -260,17 +315,74 @@ export function apply(ctx, config) {
     })().catch((error) => ctx.logger?.warn?.(`conversation-checklist: analysis failed: ${error?.message ?? error}`))
   }
 
+  /**
+   * The model may only answer WHICH open task a verified success finishes. The
+   * success itself is established here, from the logged exit code, so this path
+   * cannot manufacture progress from prose.
+   */
+  function scheduleMapping(key, doc, session, turnEnd) {
+    const open = doc.tasks.filter((t) => ['todo', 'doing'].includes(t.status) && !t.manual?.status)
+    if (open.length === 0) return
+    const events = typeof session.snapshotEvents === 'function' ? session.snapshotEvents(0) : []
+    let command = null
+    let seq = null
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const e = events[i]
+      if (e.seq >= turnEnd.seq) continue
+      if (e.type !== 'tool/result') continue
+      const data = e.data ?? {}
+      const call = toolCallFor(session, data.message?.toolCallId)
+      const input = {
+        ok: !data.error && data.message?.isError !== true,
+        toolName: call?.name ?? '',
+        argumentsText: typeof call?.arguments === 'string' ? call.arguments : '',
+        resultText: messageText(data.message),
+        seq: e.seq,
+      }
+      command = successfulCommand(input)
+      if (command) { seq = e.seq; break }
+    }
+    if (!command) return
+    const job = { seq: turnEnd.seq }
+    void (async () => {
+      try {
+        const route = modelRoute()
+        const llm = route ? ctx.get('llm') : null
+        if (!llm) return
+        const list = open.map((t) => `${t.id} :: ${t.text}`).join('\n')
+        const reply = await complete(llm, route, {
+          system: MAPPING_SYSTEM,
+          prompt: `Open tasks:\n${list}\n\nFinished command (exited 0):\n${command.slice(0, 600)}`,
+          maxTokens: 120,
+          timeoutMs: opts.model.timeoutMs,
+        })
+        const taskId = parseMapping(reply)
+        if (!taskId) return
+        await serial(key, async () => {
+          if (closed.value || docs.get(key) !== doc || doc.tracking === false) return
+          if (!completeByMapping(doc, { taskId, seq, command, sessionId: key })) return
+          await commit(key)
+        })
+      } catch (error) {
+        ctx.logger?.warn?.(`conversation-checklist: mapping failed: ${error?.message ?? error}`)
+      }
+    })()
+  }
+
   async function ingestEvent(session, event) {
     const key = String(session.id)
-    const doc = await documentFor(key)
+    const doc = await migrate(key, await documentFor(key), session)
     if (event.seq <= doc.processedSeq) return
     const missed = doc.processedSeq + 1 < event.seq && foldSnapshot(doc, session, event.seq)
-    const changed = foldEvent(doc, event) || missed
+    const changed = foldEvent(doc, event, session) || missed
     if (changed || event.type === 'turn/end') await commit(key)
 
-    if (opts.extraction === 'model' && event.type === 'turn/end' && event.data?.reason?.kind === 'completed' && doc.tracking !== false) {
-      const input = turnText(session, event)
-      if (input) scheduleModel(key, doc, input)
+    if (event.type === 'turn/end' && event.data?.reason?.kind === 'completed' && doc.tracking !== false) {
+      if (opts.extraction === 'model') {
+        const input = turnText(session, event)
+        if (input) scheduleModel(key, doc, input)
+      }
+      if (opts.mapCompletion) scheduleMapping(key, doc, session, event)
     }
   }
 
@@ -289,12 +401,27 @@ export function apply(ctx, config) {
   // activation. A Session older than this process keeps its stored document.
   async function hydrateIfNeeded(sessionId) {
     const key = String(sessionId)
-    const doc = await documentFor(key)
-    const session = ctx.get('sessions')?.get?.(key)
-    const previous = doc.processedSeq
-    foldSnapshot(doc, session)
-    if (doc.processedSeq !== previous) await commit(key)
-    return doc
+    let doc = await documentFor(key)
+    let session = ctx.get('sessions')?.get?.(key)
+    let observation
+    try {
+      if (!session) {
+        const query = ctx.get('sessionQuery')
+        if (typeof query?.observeSession === 'function') {
+          observation = await query.observeSession(key, { projectionMode: 'none' })
+          if (observation.header?.id !== key) throw new Error('History belongs to a different conversation')
+          const events = observation.events
+          session = { id: key, snapshotEvents: (from = 0, to = events.length) => events.slice(from, to) }
+        }
+      }
+      doc = await migrate(key, doc, session)
+      const previous = doc.processedSeq
+      foldSnapshot(doc, session)
+      if (doc.processedSeq !== previous) await commit(key)
+      return doc
+    } finally {
+      observation?.[Symbol.dispose]?.()
+    }
   }
 
   // -- HTTP surface ----------------------------------------------------------
@@ -309,7 +436,7 @@ export function apply(ctx, config) {
         if (!sessionId) return json(res, 400, { ok: false, error: 'sessionId-required' })
         try {
           const doc = await serial(sessionId, () => hydrateIfNeeded(sessionId))
-          json(res, 200, { ok: true, checklist: project(doc), tracking: doc.tracking !== false })
+          json(res, 200, { ok: true, version: '1.1.0', extractorVersion: EXTRACTOR_VERSION, checklist: project(doc), tracking: doc.tracking !== false })
         } catch (error) {
           json(res, 500, { ok: false, error: 'read-failed', message: String(error?.message ?? error) })
         }
@@ -380,48 +507,10 @@ export function apply(ctx, config) {
         }
         const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : ''
         if (!sessionId) return json(res, 400, { ok: false, error: 'sessionId-required' })
+        if (body.kind !== 'resync') return json(res, 403, { ok: false, error: 'conversation-managed-checklist' })
         try {
-          const result = await serial(sessionId, async () => {
-            const doc = await hydrateIfNeeded(sessionId)
-            let changed = false
-            if (body.kind === 'set-tracking') {
-              const next = body.tracking !== false
-              if (doc.tracking !== next) {
-                doc.tracking = next
-                modelJobs.delete(sessionId)
-                await commit(sessionId)
-                return { changed: true }
-              }
-              return { changed: false }
-            }
-            if (body.kind === 'rebuild') {
-              const session = ctx.get('sessions')?.get?.(sessionId)
-              if (typeof session?.snapshotEvents !== 'function') return { error: 'conversation-history-unavailable' }
-              if (doc.tracking === false) return { error: 'tracking-paused' }
-              const fresh = createDoc(sessionId)
-              fresh.dismissedSuggestions = doc.dismissedSuggestions ?? []
-              foldSnapshot(fresh, session)
-              preserveManualChanges(doc, fresh)
-              modelJobs.delete(sessionId)
-              docs.set(sessionId, fresh)
-              await commit(sessionId)
-              return { changed: true }
-            }
-            if (body.kind === 'resync') {
-              publish(sessionId)
-            } else {
-              changed = applyManual(doc, {
-                kind: String(body.kind ?? ''),
-                id: typeof body.id === 'string' ? body.id : undefined,
-                text: typeof body.text === 'string' ? body.text : undefined,
-              })
-            }
-            if (changed) await commit(sessionId)
-            else publish(sessionId)
-            return { changed }
-          })
-          if (result.error) return json(res, 409, { ok: false, error: result.error })
-          json(res, 200, { ok: true, changed: result.changed, checklist: project(docs.get(sessionId)) })
+          const doc = await serial(sessionId, () => hydrateIfNeeded(sessionId))
+          json(res, 200, { ok: true, checklist: project(doc) })
         } catch (error) {
           json(res, 500, { ok: false, error: 'action-failed', message: String(error?.message ?? error) })
         }
@@ -447,36 +536,11 @@ export function apply(ctx, config) {
   ctx.logger?.info?.(`conversation-checklist: ready (${opts.extraction} extraction, ${opts.dataDir})`)
 }
 
-function preserveManualChanges(previous, fresh) {
-  const oldById = new Map(previous.tasks.map((task) => [task.id, task]))
-  const newById = new Map(fresh.tasks.map((task) => [task.id, task]))
-  function preserve(task) {
-    const existing = newById.get(task.id)
-    if (!existing) {
-      const parent = oldById.get(task.parentId)
-      if (parent && !newById.has(parent.id)) preserve(parent)
-      const retained = { ...task, sequence: ++fresh.sequence }
-      fresh.tasks.push(retained)
-      newById.set(task.id, retained)
-      return
-    }
-    if (task.manual?.renamed) existing.text = task.text
-    if (task.manual?.status || task.manual?.dismissed) {
-      existing.status = task.status
-      existing.blockedBy = task.blockedBy
-      existing.blockedByChildId = task.blockedByChildId
-    }
-    existing.manual = { ...task.manual }
-  }
-  for (const task of previous.tasks) {
-    if (task.origin === 'native-plan' || Object.values(task.manual ?? {}).some(Boolean)) preserve(task)
-  }
-}
-
 function json(res, status, payload) {
   const body = JSON.stringify(payload)
   res.statusCode = status
   res.setHeader('content-type', 'application/json; charset=utf-8')
+  res.setHeader('cache-control', 'no-store')
   res.setHeader('content-length', Buffer.byteLength(body))
   res.end(body)
 }

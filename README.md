@@ -2,24 +2,43 @@
 
 Turns the active conversation into a live checklist in DeepSeek Harness.
 
-- **Beside the composer:** a three-line button (`conversation.input.left`) that opens a compact checklist anchored above the composer (`conversation.input.overlay`). It closes on a second click, a click outside, Escape, or a conversation switch, and never blocks the chat input.
-- **Per conversation:** both slots are Session-scoped, so the shell supplies the stable session id; tasks, subtasks, edits and sync checkpoints are keyed by it alone.
-- **Automatic:** committed session events drive the document; the open view repaints over Server-Sent Events, with no refresh and no command.
-- **Per conversation:** one JSON file per conversation, so a reconnect, a retry, or a session switch can never duplicate a task or move one conversation's state into another.
+- **Beside the composer:** a three-line button (`conversation.input.left`) opens a compact checklist anchored above the composer (`conversation.input.overlay`). It closes on a second click, a click outside, Escape, or a conversation switch, and never blocks the chat input.
+- **Per conversation:** both slots are Session-scoped, so the shell supplies the stable session id; tasks, subtasks, status, provenance and sync checkpoints are keyed by it alone.
+- **Automatic:** committed session events drive the document, and the open panel refreshes itself. Sub-task completion, blockers and cancellations from the conversation update it without a refresh or a command.
+- **Read-only panel:** the checklist reports state; it has no rename, complete, reopen or dismiss controls, and those HTTP actions return 403. Lifecycle comes from the conversation.
+- **Completion on evidence:** a task is checked off only for a verified success — a passing test run, a signing verification, a linked file write, a native-plan completion, or a shell command that reported exit 0 — or for an explicit confirmation in chat. Failed, interrupted and partial work stays open.
 
-Originally built against **DSH 0.2.2-rc.3**, profile `desktop`. Version 1.0.1 has 42 passing automated tests. Live installation and interaction tests remain pending. See REVIEW.md. It uses only supported APIs: `ctx.on('session/event')`, `ctx.sessions`, `ctx.webServer.register`, and the Client `slots` / `sessions` services. It never appends session events, never patches core, and never reads another plugin's DOM.
+Built and verified against **DSH 0.2.2-rc.3** (profile `desktop`). Requires DSH `>=0.2.2-rc.3 <0.3.0-0`. It uses only supported APIs: `ctx.on('session/event')`, `ctx.sessions`, `ctx.webServer.register`, and the Client `slots` / `sessions` services. It never appends session events, never patches core, and never reads another plugin's DOM.
 
 ## Install
 
-From the DSH GUI: **Plugins → Add plugin →** point at this directory (a local directory install links the checkout).
+Requirements: DSH 0.2.2-rc.3 or newer (below 0.3), and a writable `$DSH_HOME` (checklists live in `$DSH_HOME/plugin-data/dsh-conversation-checklist/`).
 
-From an agent session with the `plugin_manager` tool:
+**From a GitHub release (recommended).** Download the `.tgz` from the release page, then in DSH open **Plugins → Add plugin** and paste its URL:
 
 ```
-plugin_manager action=install_bundle target=/Users/rotimiadedeji/dsh-plugins/dsh-conversation-checklist
+https://github.com/OWNER/dsh-conversation-checklist/releases/latest/download/dsh-conversation-checklist-1.1.0.tgz
 ```
 
-Then open any conversation: the three-line button appears in the composer tool row. Click it to open that conversation's checklist. (If a plugin row for this bundle was previously loaded, restart DSH so the fresh JavaScript generation is used.)
+**From the repository** (tracks the default branch):
+
+```
+dsh plugin --profile <profile> add github:OWNER/dsh-conversation-checklist
+```
+
+or, with the agent's `plugin_manager` tool:
+
+```
+plugin_manager action=install_bundle target=github:OWNER/dsh-conversation-checklist
+```
+
+**From npm**, once published:
+
+```
+dsh plugin --profile <profile> add dsh-conversation-checklist
+```
+
+Open any conversation afterwards: the three-line button appears in the composer tool row. If a row for this bundle was already loaded, reload the window so the fresh client module is used.
 
 ## Remove
 
@@ -65,7 +84,7 @@ When a turn uses DSH's own `todo_write` or goal tools, that plan is shown as **D
 npm test        # or: node --test test/*.test.mjs
 ```
 
-`test/engine.test.mjs` states the acceptance scenario; `test/host.test.mjs` drives the real `apply()` against a stand-in Cordis context (events, routes, restart, isolation); `test/store.test.mjs` covers persistence.
+69 tests. `test/engine.test.mjs` covers extraction rules, completion evidence (tests, signing, file writes, native plans, `run_code` and plain `bash` exit 0, model mapping) and its refusals; `test/host.test.mjs` drives the real `apply()` through session events and the HTTP routes; `test/store.test.mjs` covers persistence and isolation.
 
 ## Limits
 

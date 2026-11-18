@@ -226,28 +226,16 @@ test('conversations stay separate and a restart restores both', async () => {
   assert.equal(restoredA.checklist.tasks[0].id, a.checklist.tasks[0].id, 'stable id across restart')
 })
 
-test('a manual rename survives later syncs and a restart', async () => {
+test('conversation corrections survive later syncs and restart', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'ccl-host-'))
   const first = fakeContext()
   apply(first.ctx, { dataDir })
   const session = fakeSession('session-a')
   await emit(first.handlers, session, userMessage('Install DSH on my iPad.', 1))
-
-  const state = await callState(first.routes, 'session-a')
-  const id = state.checklist.tasks[0].id
-  const renamed = await callAction(first.routes, { sessionId: 'session-a', kind: 'rename', id, text: 'Get DSH onto the iPad' })
-  assert.equal(renamed.ok, true)
-  assert.equal(renamed.checklist.tasks[0].text, 'Get DSH onto the iPad')
-
-  await emit(first.handlers, session, assistantMessage('The app needs signing.', 2))
-  await emit(first.handlers, session, userMessage('Install DSH on my iPad.', 3))
-
-  const second = fakeContext()
-  apply(second.ctx, { dataDir })
-  const restored = await callState(second.routes, 'session-a')
-  const install = restored.checklist.tasks.find((t) => t.id === id)
-  assert.equal(install.text, 'Get DSH onto the iPad', 'manual edit kept')
-  assert.equal(restored.checklist.tasks.filter((t) => /DSH onto|Install DSH on my iPad/.test(t.text)).length, 1)
+  await emit(first.handlers, session, userMessage('Rename the iPad installation to Get DSH onto the iPad.', 2))
+  first.dispose()
+  const second = fakeContext(); apply(second.ctx, { dataDir })
+  assert.equal((await callState(second.routes, 'session-a')).checklist.tasks[0].text, 'Get DSH onto the iPad')
 })
 
 test('a conversation that already ran is analyzed on first sight (backfill)', async () => {
@@ -272,23 +260,22 @@ test('a conversation that already ran is analyzed on first sight (backfill)', as
   )
 })
 
-test('tracking can be turned off and on per conversation', async () => {
+test('the HTTP API rejects manual lifecycle controls and keeps tracking active', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'ccl-host-'))
-  const { ctx, handlers, routes } = fakeContext()
-  apply(ctx, { dataDir })
+  const host = fakeContext(); apply(host.ctx, { dataDir })
   const session = fakeSession('session-a')
-  await emit(handlers, session, userMessage('Install DSH on my iPad.', 1))
-
-  await callAction(routes, { sessionId: 'session-a', kind: 'set-tracking', tracking: false })
-  await emit(handlers, session, userMessage('Also back up my DSH settings.', 2))
-  let state = await callState(routes, 'session-a')
-  assert.equal(state.checklist.tracking, false)
-  assert.deepEqual(state.checklist.tasks.map((t) => t.text), ['Install DSH on my iPad'])
-
-  await callAction(routes, { sessionId: 'session-a', kind: 'set-tracking', tracking: true })
-  await emit(handlers, session, userMessage('Deploy the release.', 3))
-  state = await callState(routes, 'session-a')
-  assert.ok(state.checklist.tasks.some((t) => /Deploy the release/.test(t.text)))
+  await emit(host.handlers, session, userMessage('Install DSH on my iPad.', 1))
+  const task = (await callState(host.routes, 'session-a')).checklist.tasks[0]
+  for (const kind of ['dismiss','complete','reopen','rename','restore','accept-suggestion','dismiss-suggestion','set-tracking','rebuild']) {
+    const result = await callAction(host.routes, {sessionId:'session-a', kind, id:task.id, tracking:false, text:'Changed'})
+    assert.equal(result.ok, false)
+    assert.equal(result.error, 'conversation-managed-checklist')
+  }
+  await emit(host.handlers, session, userMessage('Signing is done.', 2))
+  const state = await callState(host.routes, 'session-a')
+  assert.equal(state.checklist.tracking, true)
+  assert.equal(state.checklist.tasks[0].text,task.text)
+  assert.equal(state.checklist.tasks[0].status,'todo')
 })
 
 test('model extraction is opt-in, uses the configured route, and falls back', async () => {
@@ -298,7 +285,7 @@ test('model extraction is opt-in, uses the configured route, and falls back', as
     stream(options) {
       calls.push(options)
       return (async function* once() {
-        yield { type: 'text-delta', index: 0, text: JSON.stringify({ ops: [{ op: 'add', text: 'Model-derived task', parent: null }] }) }
+        yield { type: 'text-delta', index: 0, text: JSON.stringify({ ops: [{ op: 'add', text: 'Verify model extraction', parent: null }] }) }
         yield { type: 'finish', reason: { kind: 'stop' } }
       })()
     },
@@ -317,7 +304,7 @@ test('model extraction is opt-in, uses the configured route, and falls back', as
   assert.equal(calls[0].provider, 'deepseek-official')
   assert.ok(calls[0].messages[0].content[0].text.includes('Install DSH on my iPad'), 'only the relevant text')
   const state = await callState(routes, 'session-a')
-  assert.ok(state.checklist.tasks.some((t) => t.text === 'Model-derived task'))
+  assert.ok(state.checklist.tasks.some((t) => t.text === 'Verify model extraction'))
 
   // A failing route must not lose the deterministic result.
   const broken = fakeContext({
@@ -454,4 +441,147 @@ test('the storage key is the session id, never the title or the open chat', asyn
   const stateB = await callState(first.routes, 'session-same-title-b')
   assert.deepEqual(stateA.checklist.tasks.map((t) => t.text), ['Install DSH on my iPad'])
   assert.deepEqual(stateB.checklist.tasks.map((t) => t.text), ['Write the quarterly report'])
+})
+
+test('a real live tool result resolves its call and publishes completed status',async()=>{
+ const dataDir=await mkdtemp(join(tmpdir(),'ccl-live-proof-'))
+ const host=fakeContext()
+ apply(host.ctx,{dataDir})
+ const a=fakeSession('proof-a')
+ await emit(host.handlers,a,userMessage('Run the regression tests.',1))
+ await emit(host.handlers,a,event('tool/call',2,{callId:'call-tests',name:'bash',arguments:JSON.stringify({command:'pytest tests/regression'})}))
+ await emit(host.handlers,a,event('tool/result',3,{message:{role:'tool',toolCallId:'call-tests',isError:false,content:[{type:'text',text:'12 passed in 3.1s'}]}}))
+ const state=await callState(host.routes,'proof-a')
+ assert.equal(state.checklist.tasks[0].status,'done')
+ assert.equal(state.checklist.tasks[0].completedBy.seq,3)
+ assert.equal(state.checklist.tasks[0].completedBy.sessionId,'proof-a')
+})
+
+test('extractor upgrade backs up history and restores conversation ownership',async()=>{
+ const {readFile,writeFile,readdir}=await import('node:fs/promises')
+ const dataDir=await mkdtemp(join(tmpdir(),'ccl-migration-'))
+ const a=fakeSession('migrate-a')
+ const host=fakeContext({sessions:{get:()=>a}})
+ apply(host.ctx,{dataDir})
+ await emit(host.handlers,a,userMessage('Install DSH on my iPad.',1))
+ const task=(await callState(host.routes,'migrate-a')).checklist.tasks[0]
+ await callAction(host.routes,{sessionId:'migrate-a',kind:'rename',id:task.id,text:'My iPad setup'})
+ await callAction(host.routes,{sessionId:'migrate-a',kind:'complete',id:task.id})
+ host.dispose()
+ const dir=join(dataDir,'dsh-conversation-checklist'),file=join(dir,'migrate-a.json')
+ const doc=JSON.parse(await readFile(file,'utf8'))
+ doc.tasks[0].manual={status:true,dismissed:true}
+ doc.tasks[0].status='dismissed'
+ doc.extractorVersion=2
+ doc.tasks.push({...doc.tasks[0],id:'junk',text:'Until then',manual:{},parentId:null})
+ await writeFile(file,JSON.stringify(doc))
+ const next=fakeContext({sessions:{get:()=>a}})
+ apply(next.ctx,{dataDir})
+ const upgraded=(await callState(next.routes,'migrate-a')).checklist
+ assert.equal(upgraded.tasks.length,1)
+ assert.equal(upgraded.tasks[0].text,'Install DSH on my iPad')
+ assert.equal(upgraded.tasks[0].status,'todo')
+ assert.equal(upgraded.migrationPending,false)
+ assert.ok((await readdir(dir)).some(name=>name.includes('before-extractor-2')))
+ next.dispose()
+})
+
+test('history unavailable keeps the old document and reports migration pending',async()=>{
+ const {readFile,writeFile}=await import('node:fs/promises')
+ const dataDir=await mkdtemp(join(tmpdir(),'ccl-pending-'))
+ const host=fakeContext()
+ apply(host.ctx,{dataDir})
+ await emit(host.handlers,fakeSession('old'),userMessage('Install DSH on my iPad.',1))
+ host.dispose()
+ const file=join(dataDir,'dsh-conversation-checklist','old.json')
+ const old=JSON.parse(await readFile(file,'utf8'));old.extractorVersion=2
+ await writeFile(file,JSON.stringify(old))
+ const next=fakeContext();apply(next.ctx,{dataDir})
+ const result=(await callState(next.routes,'old')).checklist
+ assert.equal(result.tasks.length,1)
+ assert.equal(result.migrationPending,true)
+ next.dispose()
+})
+
+test('cold conversation history is loaded automatically through sessionQuery',async()=>{
+ const {writeFile,mkdir}=await import('node:fs/promises')
+ const dataDir=await mkdtemp(join(tmpdir(),'ccl-cold-'))
+ const {createDoc}=await import('../lib/engine.js')
+ const dir=join(dataDir,'dsh-conversation-checklist');await mkdir(dir)
+ const old=createDoc('cold');old.extractorVersion=2
+ old.tasks=[{id:'junk',parentId:null,text:'Until then',status:'todo',manual:{},sequence:1}]
+ await writeFile(join(dir,'cold.json'),JSON.stringify(old))
+ let disposed=false,reads=0
+ const host=fakeContext({sessionQuery:{async observeSession(id,options){
+  reads++;assert.equal(id,'cold');assert.equal(options.projectionMode,'none')
+  return {header:{id},events:[userMessage('Run the regression tests.',0)], [Symbol.dispose](){disposed=true}}
+ }}})
+ apply(host.ctx,{dataDir})
+ const state=await callState(host.routes,'cold')
+ assert.equal(reads,1);assert.equal(disposed,true)
+ assert.equal(state.checklist.migrationPending,false)
+ assert.deepEqual(state.checklist.tasks.map(t=>t.text),['Run the regression tests'])
+ host.dispose()
+})
+
+test('live PTC test execution checks off its own task',async()=>{
+ const dataDir=await mkdtemp(join(tmpdir(),'ccl-ptc-'))
+ const host=fakeContext();apply(host.ctx,{dataDir});const a=fakeSession('ptc')
+ await emit(host.handlers,a,userMessage('Run the regression tests.',0))
+ const code = 'const r = await tools.bash({command: "cd app && .venv/bin/pytest tests/regression -q"}); console.log(r.stdout.text, r.stderr.text, r.exitCode);'
+ await emit(host.handlers,a,event('tool/call',1,{callId:'ptc-test',name:'run_code',arguments:JSON.stringify({code})}))
+ await emit(host.handlers,a,event('tool/result',2,{message:{role:'tool',toolCallId:'ptc-test',isError:false,content:[{type:'text',text:'12 passed in 2s\n 0'}]}}))
+ assert.equal((await callState(host.routes,'ptc')).checklist.tasks[0].status,'done')
+ host.dispose()
+})
+
+test('model mapping closes a task for a verified exit-0 command only', async () => {
+  const run = async (tail) => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'ccl-map-'))
+    const systems = []
+    const llm = {
+      stream(options) {
+        const system = options.system ?? ''
+        systems.push(system)
+        let text = '{"ops":[]}'
+        if (/match one finished shell command/.test(system)) {
+          const body = options.messages[0].content[0].text
+          const m = /^(\S+) ::/m.exec(body)
+          text = JSON.stringify({ task: m ? m[1] : null })
+        }
+        return (async function* once() {
+          yield { type: 'text-delta', index: 0, text }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })()
+      },
+    }
+    const { ctx, handlers, routes } = fakeContext({
+      llm,
+      agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+    })
+    apply(ctx, { dataDir, extraction: 'model' })
+    const session = fakeSession('session-map')
+    await emit(handlers, session, userMessage('Start the phase0 compose stack.', 1))
+    await emit(handlers, session, event('tool/call', 2, {
+      turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: JSON.stringify({ command: 'docker compose up -d' }),
+    }))
+    await emit(handlers, session, event('tool/result', 3, {
+      turn: 1, step: 1, message: { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: `up\n${tail}` }] },
+    }))
+    await emit(handlers, session, event('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }))
+    await tick()
+    await tick()
+    const state = await callState(routes, 'session-map')
+    return { state, systems }
+  }
+
+  const ok = await run('[exit: 0 ]')
+  const task = ok.state.checklist.tasks[0]
+  assert.equal(task.status, 'done', 'mapping completed it')
+  assert.match(task.completedBy.reason, /model mapped an exit-0 command/)
+  assert.ok(ok.systems.some((s) => /match one finished shell command/.test(s)), 'mapping was asked')
+
+  const bad = await run('[exit code: 1]')
+  assert.equal(bad.state.checklist.tasks[0].status, 'todo', 'a failed command never maps')
+  assert.equal(bad.systems.some((s) => /match one finished shell command/.test(s)), false, 'no mapping call without a success')
 })

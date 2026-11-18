@@ -21,15 +21,18 @@ window.__ModuleLoader__.load({
     const PANEL_WIDTH = 380
     const EMPTY = { phase: 'idle', checklist: null, tracking: true, error: null }
 
-    // -- data store ------------------------------------------------------------
-    // One stream for the conversation being watched. Switching conversations
-    // closes the previous stream first, and every frame is checked against the
-    // id it was opened for, so one conversation's data cannot land in another.
+    // Load finite JSON snapshots through the desktop fetch bridge.
+    // Only an open checklist polls. Session event tracking continues on the host.
     function createDataStore() {
       let state = EMPTY
       let sessionId = null
-      let source = null
       let generation = 0
+      let visible = false
+      let timer = null
+      let pendingRead = null
+      let writes = 0
+      let mutation = 0
+      let failures = 0
       const subscribers = new Set()
 
       const emit = (next) => {
@@ -37,14 +40,54 @@ window.__ModuleLoader__.load({
         for (const fn of subscribers) fn()
       }
 
-      const closeStream = () => {
-        if (source !== null) {
-          try {
-            source.close()
-          } catch {
-            /* ignore */
+      const cancelRead = () => {
+        clearTimeout(timer)
+        timer = null
+        if (pendingRead) {
+          pendingRead.abort()
+          pendingRead = null
+        }
+      }
+
+      const schedule = () => {
+        clearTimeout(timer)
+        timer = null
+        if (sessionId === null || !visible) return
+        const delay = Math.min(30000, 2000 * 2 ** Math.min(failures, 4))
+        timer = setTimeout(() => { void refresh() }, delay)
+      }
+
+      async function refresh() {
+        if (sessionId === null || pendingRead || writes > 0) return
+        const id = sessionId
+        const version = generation
+        const mutationAtStart = mutation
+        const controller = new AbortController()
+        pendingRead = controller
+        const timeout = setTimeout(() => controller.abort(), 10000)
+        try {
+          const response = await fetch(`${API}/state?sessionId=${encodeURIComponent(id)}`, {
+            cache: 'no-store',
+            signal: controller.signal,
+            headers: { accept: 'application/json' },
+          })
+          if (!response.ok) throw new Error(`http-${response.status}`)
+          const payload = await response.json()
+          if (sessionId !== id || generation !== version || mutation !== mutationAtStart) return
+          if (payload?.ok !== true || String(payload.checklist?.sessionId) !== id) {
+            throw new Error('Invalid checklist response')
           }
-          source = null
+          failures = 0
+          emit({ phase: 'ready', checklist: payload.checklist, tracking: payload.checklist.tracking !== false, error: null })
+        } catch (error) {
+          if (sessionId !== id || generation !== version || mutation !== mutationAtStart || pendingRead !== controller) return
+          failures += 1
+          const detail = error?.name === 'AbortError' ? 'Request timed out' : String(error?.message ?? error)
+          emit({ ...state, phase: state.checklist ? 'ready' : 'error', error: `Unable to refresh checklist. ${detail}. Retrying…` })
+        } finally {
+          clearTimeout(timeout)
+          if (pendingRead === controller) pendingRead = null
+          if (sessionId === id && generation === version) schedule()
         }
       }
 
@@ -57,66 +100,71 @@ window.__ModuleLoader__.load({
         view(nextSessionId) {
           const id = nextSessionId ? String(nextSessionId) : null
           if (id === sessionId) return
+          generation += 1
           sessionId = id
-          const version = ++generation
-          closeStream()
-          if (id === null) {
-            emit(EMPTY)
-            return
-          }
-          emit({ ...EMPTY, phase: 'loading' })
-          try {
-            source = new EventSource(`${API}/stream?sessionId=${encodeURIComponent(id)}`)
-            source.onmessage = (event) => {
-              if (sessionId !== id || generation !== version) return
-              let payload
-              try {
-                payload = JSON.parse(event.data)
-              } catch {
-                return
-              }
-              // Stale frame for a conversation that is no longer on screen.
-              if (!payload || String(payload.sessionId) !== id) return
-              emit({ phase: 'ready', checklist: payload, tracking: payload.tracking !== false, error: null })
-            }
-            source.onerror = () => {
-              if (sessionId !== id || generation !== version) return
-              emit({ ...state, error: 'Connection lost. Reconnecting…' })
-            }
-          } catch (error) {
-            emit({ ...EMPTY, phase: 'error', error: String(error?.message ?? error) })
+          writes = 0
+          failures = 0
+          cancelRead()
+          emit(id === null ? EMPTY : { ...EMPTY, phase: 'loading' })
+          if (id !== null) void refresh()
+        },
+        setVisible(next) {
+          visible = Boolean(next)
+          if (visible) {
+            if (!pendingRead) void refresh()
+          } else {
+            clearTimeout(timer)
+            timer = null
           }
         },
+        refresh,
         async act(body) {
           if (sessionId === null) return
-          const forSession = sessionId
+          const id = sessionId
           const version = generation
+          const mutationAtStart = ++mutation
+          writes += 1
+          cancelRead()
+          const controller = new AbortController()
+          const timeout = setTimeout(() => controller.abort(), 15000)
           try {
             const response = await fetch(`${API}/action`, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ ...body, sessionId: forSession }),
+              signal: controller.signal,
+              body: JSON.stringify({ ...body, sessionId: id }),
             })
-            const payload = await response.json().catch(() => null)
-            // A reply that arrives after a switch belongs to the old panel.
-            if (sessionId !== forSession || generation !== version) return
-            if (response.ok && payload?.checklist?.sessionId === forSession) emit({ ...state, phase: 'ready', checklist: payload.checklist, error: null })
-            else if (!response.ok) emit({ ...state, error: payload?.error ?? `http-${response.status}` })
+            const payload = await response.json()
+            if (sessionId !== id || generation !== version || mutation !== mutationAtStart) return
+            if (!response.ok || payload?.ok !== true || String(payload.checklist?.sessionId) !== id) {
+              throw new Error(payload?.error ?? `http-${response.status}`)
+            }
+            failures = 0
+            emit({ phase: 'ready', checklist: payload.checklist, tracking: payload.checklist.tracking !== false, error: null })
           } catch (error) {
-            if (sessionId !== forSession || generation !== version) return
-            emit({ ...state, error: String(error?.message ?? error) })
+            if (sessionId !== id || generation !== version || mutation !== mutationAtStart) return
+            emit({ ...state, error: `Checklist update failed. ${String(error?.message ?? error)}` })
+          } finally {
+            clearTimeout(timeout)
+            if (sessionId === id && generation === version) {
+              writes -= 1
+              if (writes === 0) void refresh()
+            }
           }
         },
         reset() {
           generation += 1
           sessionId = null
-          closeStream()
+          visible = false
+          writes = 0
+          cancelRead()
           emit(EMPTY)
         },
         dispose() {
           generation += 1
           sessionId = null
-          closeStream()
+          visible = false
+          cancelRead()
           subscribers.clear()
         },
       }
@@ -191,7 +239,7 @@ window.__ModuleLoader__.load({
 .ccl-row{display:flex;align-items:flex-start;gap:6px;padding:3px 4px;border-radius:5px}
 .ccl-row:hover{background:var(--dsw-alias-bg-layer-1)}
 .ccl-twisty{width:14px;height:16px;flex:0 0 14px;border:0;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;padding:0;font-size:9px;line-height:14px}
-.ccl-check{width:15px;height:15px;flex:0 0 15px;margin-top:2px;border-radius:50%;border:1.5px solid var(--dsw-alias-border-l2);background:transparent;cursor:pointer;padding:0;display:flex;align-items:center;justify-content:center;font-size:9px;line-height:1;color:var(--dsw-alias-bg-base)}
+.ccl-check{width:15px;height:15px;flex:0 0 15px;margin-top:2px;border-radius:50%;border:1.5px solid var(--dsw-alias-border-l2);background:transparent;cursor:default;padding:0;display:flex;align-items:center;justify-content:center;font-size:9px;line-height:1;color:var(--dsw-alias-bg-base)}
 .ccl-check:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
 .ccl-check[data-status="done"]{background:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}
 .ccl-check[data-status="blocked"]{border-color:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-state-warn-primary)}
@@ -200,16 +248,8 @@ window.__ModuleLoader__.load({
 .ccl-text[data-status="done"]{color:var(--dsw-alias-label-secondary);text-decoration:line-through}
 .ccl-meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:1px;font-size:10.5px;color:var(--dsw-alias-label-secondary)}
 .ccl-meta[data-blocked="true"]{color:var(--dsw-alias-state-warn-primary)}
-.ccl-actions{display:flex;gap:2px;opacity:0}
-.ccl-row:hover .ccl-actions,.ccl-row:focus-within .ccl-actions{opacity:1}
-.ccl-mini{font:inherit;font-size:10.5px;color:var(--dsw-alias-label-secondary);background:transparent;border:0;cursor:pointer;padding:1px 4px;border-radius:4px}
-.ccl-mini:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
-.ccl-mini:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-.ccl-input{font:inherit;width:100%;background:var(--dsw-alias-bg-layer-2);color:inherit;border:1px solid var(--dsw-alias-brand-primary);border-radius:5px;padding:2px 5px}
-.ccl-section{margin:10px 2px 3px;font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
 .ccl-empty{padding:14px 10px;color:var(--dsw-alias-label-secondary);line-height:1.5}
 .ccl-error{margin:5px 2px;padding:5px 7px;border-radius:5px;border:1px solid var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary);font-size:11.5px}
-.ccl-sugg{display:flex;gap:5px;align-items:flex-start;padding:3px 5px;border-left:2px solid var(--dsw-alias-border-l2);margin:2px 0 2px 4px}
 `
 
     function Styles() {
@@ -290,7 +330,6 @@ window.__ModuleLoader__.load({
       const state = React.useSyncExternalStore(data.subscribe, data.getSnapshot, data.getSnapshot)
       const panelRef = React.useRef(null)
       const [collapsed, setCollapsed] = React.useState({})
-      const [renaming, setRenaming] = React.useState(null)
       // The panel's own `sessionId` prop can lag one frame behind a chat switch;
       // the store's `openFor` is the single conversation whose panel is open.
       const [anchor, setAnchor] = React.useState(snapshot.anchor)
@@ -300,7 +339,6 @@ window.__ModuleLoader__.load({
       const tasks = checklist?.tasks ?? []
       React.useEffect(() => {
         setCollapsed({})
-        setRenaming(null)
         data.view(sessionId)
       }, [sessionId, data])
 
@@ -363,7 +401,6 @@ window.__ModuleLoader__.load({
         return { left, bottom, width }
       })()
 
-      const handle = (body) => data.act(body)
       const top = tasks.filter((t) => t.parentId === null && t.status !== 'dismissed')
       const childrenOf = (id) => tasks.filter((t) => t.parentId === id && t.status !== 'dismissed')
 
@@ -389,51 +426,14 @@ window.__ModuleLoader__.load({
                   isCollapsed ? '▶' : '▼',
                 )
               : h('span', { className: 'ccl-twisty', 'aria-hidden': true }),
-            h(
-              'button',
-              {
-                className: 'ccl-check',
-                type: 'button',
-                'data-status': task.status,
-                'aria-label': `${task.status === 'done' ? 'Reopen' : 'Complete'} ${task.text}`,
-                title: task.status === 'done' ? 'Reopen' : 'Complete',
-                onClick: () => handle({ kind: task.status === 'done' ? 'reopen' : 'complete', id: task.id }),
-              },
-              task.status === 'done' ? '✓' : task.status === 'blocked' ? '!' : '',
-            ),
+            h('span', { className: 'ccl-check', role: 'checkbox', 'aria-checked': task.status === 'done',
+              'aria-readonly': true, 'aria-label': task.text, 'data-status': task.status,
+              title: task.completedBy?.reason ?? task.status },
+              task.status === 'done' ? '✓' : task.status === 'blocked' ? '!' : ''),
             h(
               'div',
               { className: 'ccl-main' },
-              renaming === task.id
-                ? h('input', {
-                    className: 'ccl-input',
-                    defaultValue: task.text,
-                    autoFocus: true,
-                    'aria-label': 'Task name',
-                    onBlur: (event) => {
-                      const text = event.target.value.trim()
-                      if (text && text !== task.text) handle({ kind: 'rename', id: task.id, text })
-                      setRenaming(null)
-                    },
-                    onKeyDown: (event) => {
-                      if (event.key === 'Enter') event.target.blur()
-                      if (event.key === 'Escape') {
-                        event.stopPropagation()
-                        event.target.value = task.text
-                        setRenaming(null)
-                      }
-                    },
-                  })
-                : h(
-                    'span',
-                    {
-                      className: 'ccl-text',
-                      'data-status': task.status,
-                      title: 'Double-click to rename',
-                      onDoubleClick: () => setRenaming(task.id),
-                    },
-                    task.text,
-                  ),
+              h('span', { className: 'ccl-text', 'data-status': task.status, title: task.description ?? task.text }, task.text),
               h(
                 'div',
                 { className: 'ccl-meta', 'data-blocked': String(task.status === 'blocked') },
@@ -441,12 +441,6 @@ window.__ModuleLoader__.load({
                 kids.length > 0 ? h('span', null, `${kids.length} subtask${kids.length === 1 ? '' : 's'}`) : null,
                 task.sourceRef ? h('span', null, task.sourceRef) : null,
               ),
-            ),
-            h(
-              'div',
-              { className: 'ccl-actions' },
-              h('button', { className: 'ccl-mini', type: 'button', onClick: () => setRenaming(task.id) }, 'Rename'),
-              h('button', { className: 'ccl-mini', type: 'button', onClick: () => handle({ kind: 'dismiss', id: task.id }) }, 'Dismiss'),
             ),
           ),
           kids.length > 0 && !isCollapsed ? kids.map((kid) => row(kid, depth + 1)) : null,
@@ -471,23 +465,6 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'ccl-head' },
           h('span', { className: 'ccl-title' }, 'Conversation checklist'),
-          h(
-            'button',
-            {
-              className: 'ccl-icon',
-              type: 'button',
-              'aria-pressed': String(checklist?.tracking !== false),
-              'aria-label': checklist?.tracking === false ? 'Turn tracking on' : 'Turn tracking off',
-              title: checklist?.tracking === false ? 'Tracking off' : 'Tracking on',
-              onClick: () => handle({ kind: 'set-tracking', tracking: !(checklist?.tracking !== false) }),
-            },
-            checklist?.tracking === false ? '○' : '●',
-          ),
-          h(
-            'button',
-            { className: 'ccl-icon', type: 'button', title: 'Rebuild from this conversation', 'aria-label': 'Rebuild from this conversation', onClick: () => handle({ kind: 'rebuild' }), disabled: !checklist || checklist.tracking === false },
-            '↻',
-          ),
           h('button', { className: 'ccl-icon', type: 'button', 'aria-label': 'Close checklist', title: 'Close', onClick: () => ui.close() }, '×'),
         ),
         h(
@@ -502,41 +479,8 @@ window.__ModuleLoader__.load({
                 'No tasks in this conversation yet. Ask for something concrete and it appears here automatically.',
               )
             : null,
+          checklist?.migrationPending ? h('div', { className: 'ccl-empty' }, 'Checklist reassessment pending. The plugin is loading this conversation’s history to update older automatic items.') : null,
           top.map((task) => row(task, 0)),
-          (checklist?.suggestions ?? []).length > 0
-            ? [
-                h('div', { key: 's', className: 'ccl-section' }, 'Suggestions'),
-                ...(checklist.suggestions ?? []).map((suggestion) =>
-                  h(
-                    'div',
-                    { key: suggestion.id, className: 'ccl-sugg' },
-                    h('div', { className: 'ccl-main' }, h('span', { className: 'ccl-text' }, suggestion.text)),
-                    h('button', { className: 'ccl-mini', type: 'button', onClick: () => handle({ kind: 'accept-suggestion', id: suggestion.id }) }, 'Accept'),
-                    h('button', { className: 'ccl-mini', type: 'button', onClick: () => handle({ kind: 'dismiss-suggestion', id: suggestion.id }) }, 'Dismiss'),
-                  ),
-                ),
-              ]
-            : null,
-          (checklist?.nativePlan?.todos ?? []).length > 0 || checklist?.nativePlan?.goal
-            ? [
-                h('div', { key: 'n', className: 'ccl-section' }, 'DSH plan'),
-                checklist.nativePlan.goal
-                  ? h('div', { key: 'g', className: 'ccl-sugg' }, h('div', { className: 'ccl-main' }, h('span', { className: 'ccl-text' }, checklist.nativePlan.goal.objective)))
-                  : null,
-                ...(checklist.nativePlan.todos ?? []).map((todo) =>
-                  h(
-                    'div',
-                    { key: `t-${todo.id}`, className: 'ccl-sugg' },
-                    h(
-                      'div',
-                      { className: 'ccl-main' },
-                      h('span', { className: 'ccl-text', 'data-status': todo.status === 'completed' ? 'done' : 'todo' }, todo.content),
-                    ),
-                    h('button', { className: 'ccl-mini', type: 'button', onClick: () => handle({ kind: 'merge-native', id: todo.id }) }, 'Add'),
-                  ),
-                ),
-              ]
-            : null,
         ),
       )
 
@@ -550,8 +494,13 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         const data = createDataStore()
         const ui = createUiStore()
+        const stopVisibility = ui.subscribe(() => data.setVisible(ui.getSnapshot().openFor !== null))
 
-        ctx.effect(() => () => data.dispose(), 'dsh-conversation-checklist.data')
+        ctx.effect(() => {
+          const refresh = () => { if (ui.getSnapshot().openFor !== null) void data.refresh() }
+          window.addEventListener('focus', refresh)
+          return () => { window.removeEventListener('focus', refresh); data.dispose() }
+        }, 'dsh-conversation-checklist.data')
 
         const stopButton = ctx.slots.inject('conversation.input.left', () =>
           ctx.slots.register(
@@ -568,6 +517,7 @@ window.__ModuleLoader__.load({
         )
 
         ctx.effect(() => () => {
+          stopVisibility()
           stopButton?.()
           stopPanel?.()
           data.dispose()

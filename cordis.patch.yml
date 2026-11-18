@@ -19,6 +19,9 @@
         # 'model' = use the route below (or the profile default route) instead,
         #           falling back to the rules when the call fails.
         extraction: rules
+        # One bounded model call per turn that produced a verified exit-0
+        # command; asks only which open task that command finished.
+        mapCompletion: true
         maxTasks: 300
         model:
           provider: ''

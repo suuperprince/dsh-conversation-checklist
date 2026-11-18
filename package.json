@@ -1,6 +1,6 @@
 {
   "name": "dsh-conversation-checklist",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "A live, independent per-session conversation checklist opened from a three-line composer button.",
@@ -53,5 +53,13 @@
       },
       "note": "Uses supported session events, web routes and session-scoped composer slots. See REVIEW.md for verified fixes and remaining live validation."
     }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OWNER/dsh-conversation-checklist.git"
+  },
+  "homepage": "https://github.com/OWNER/dsh-conversation-checklist#readme",
+  "bugs": {
+    "url": "https://github.com/OWNER/dsh-conversation-checklist/issues"
   }
 }
