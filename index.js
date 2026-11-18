@@ -22,6 +22,7 @@ import {
   ingestToolResult,
   successfulCommand,
   completeByMapping,
+  completeFromAssistantProse,
   ingestAnswer,
   EXTRACTOR_VERSION,
   applyOps,
@@ -53,6 +54,7 @@ function optionsOf(config) {
     // Model mapping: one bounded call per finished turn that actually produced a
     // verified exit-0 command, asking only which open task that command finished.
     mapCompletion: raw.mapCompletion !== false,
+    proseCompletion: raw.proseCompletion !== false,
     mapAuditLimit: Number.isFinite(raw.mapAuditLimit) ? raw.mapAuditLimit : 40,
     dataDir: join(dataRoot, 'dsh-conversation-checklist'),
     model: {
@@ -234,6 +236,11 @@ export function apply(ctx, config) {
         const text = messageText(assistant ? data?.message : data)
         if (text) {
           changed = ingestMessage(doc, { role: human ? 'user' : 'assistant', text, seq: event.seq }).changed
+          // Assistant-verified prose: a deliberate loosening for work whose
+          // success exists only as a sentence. Guards live in the engine.
+          if (assistant && opts.proseCompletion) {
+            changed = completeFromAssistantProse(doc, { text, seq: event.seq, sessionId: doc.sessionId }) || changed
+          }
         }
       }
       if (event?.type === 'tool/call' && session) {

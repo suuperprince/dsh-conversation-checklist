@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createDoc, ingestMessage, applyManual, ingestNativePlan, ingestToolResult, successfulCommand, completeByMapping, project } from '../lib/engine.js'
+import { createDoc, ingestMessage, applyManual, ingestNativePlan, ingestToolResult, successfulCommand, completeByMapping, completeFromAssistantProse, project } from '../lib/engine.js'
 
 /** Render the tree so a hierarchy assertion reads like the requirement. */
 function tree(doc) {
@@ -488,4 +488,29 @@ test('completeByMapping closes one open task and refuses locks', () => {
   say(doc2, 'user', 'Start the phase0 compose stack.', 1)
   applyManualStatusLock(doc2, doc2.tasks[0].id)
   assert.equal(completeByMapping(doc2, { taskId: doc2.tasks[0].id, seq: 79, command: 'y' }), false, 'manual lock wins')
+})
+
+test('an assistant completion claim closes the single matching task', () => {
+  const doc = createDoc('s-prose')
+  say(doc, 'user', 'Review deployment errors.', 1)
+  const task = doc.tasks[0]
+  assert.equal(completeFromAssistantProse(doc, { text: 'The review is complete: I checked every deployment error.', seq: 5 }), true)
+  assert.equal(task.status, 'done')
+  assert.equal(task.completedBy.kind, 'assistant-verified')
+})
+
+test('questions, hedges and future claims never complete a task', () => {
+  const doc = createDoc('s-prose2')
+  say(doc, 'user', 'Review deployment errors.', 1)
+  assert.equal(completeFromAssistantProse(doc, { text: 'Is the review complete?', seq: 5 }), false)
+  assert.equal(completeFromAssistantProse(doc, { text: 'I will finish the review of deployment errors.', seq: 6 }), false)
+  assert.equal(completeFromAssistantProse(doc, { text: 'The review is not yet complete; deployment errors remain.', seq: 7 }), false)
+  assert.equal(doc.tasks[0].status, 'todo')
+})
+
+test('a destructive outcome needs an explicit verification word', () => {
+  const doc = createDoc('s-prose3')
+  say(doc, 'user', 'Deploy the release.', 1)
+  assert.equal(completeFromAssistantProse(doc, { text: 'The release deploy is done.', seq: 9 }), false)
+  assert.equal(completeFromAssistantProse(doc, { text: 'The release deploy is done and verified on the target.', seq: 10 }), true)
 })

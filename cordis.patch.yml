@@ -22,6 +22,9 @@
         # One bounded model call per turn that produced a verified exit-0
         # command; asks only which open task that command finished.
         mapCompletion: true
+        # Accept an assistant sentence that reports completion as evidence for a
+        # narrow, non-destructive task (no questions, no future/hedged claims).
+        proseCompletion: true
         maxTasks: 300
         model:
           provider: ''
