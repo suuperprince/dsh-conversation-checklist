@@ -507,7 +507,29 @@ export function apply(ctx, config) {
         }
         const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : ''
         if (!sessionId) return json(res, 400, { ok: false, error: 'sessionId-required' })
-        if (body.kind !== 'resync') return json(res, 403, { ok: false, error: 'conversation-managed-checklist' })
+        if (body.kind !== 'resync' && body.kind !== 'reaudit') return json(res, 403, { ok: false, error: 'conversation-managed-checklist' })
+        if (body.kind === 'reaudit') {
+          // Maintenance: replay every stored conversation through the current
+          // rules so already-derived checklists pick up new completion evidence.
+          const keys = await store.list()
+          const summary = { sessions: 0, failed: 0, doneBefore: 0, doneAfter: 0, gained: [] }
+          for (const key of keys) {
+            try {
+              const before = project(await documentFor(key))
+              const doc = await serial(key, () => hydrateIfNeeded(key))
+              const after = project(doc)
+              summary.sessions += 1
+              summary.doneBefore += before.counts.done
+              summary.doneAfter += after.counts.done
+              const delta = after.counts.done - before.counts.done
+              if (delta > 0) summary.gained.push({ sessionId: key, added: delta, newlyDone: after.tasks.filter((t) => t.status === 'done' && !before.tasks.some((b) => b.id === t.id && b.status === 'done')).map((t) => t.text.slice(0, 60)) })
+            } catch (error) {
+              summary.failed += 1
+              ctx.logger?.warn?.(`conversation-checklist: reaudit failed for ${key}: ${error?.message ?? error}`)
+            }
+          }
+          return json(res, 200, { ok: true, ...summary })
+        }
         try {
           const doc = await serial(sessionId, () => hydrateIfNeeded(sessionId))
           json(res, 200, { ok: true, checklist: project(doc) })
